@@ -1,0 +1,228 @@
+h#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN 5    // Pin für die Neopixel
+#define LED_COUNT 12 // Anzahl der LEDs
+#define DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/1315073472182878208/-xM9KI3ItDqpGlLFxJ5vRJGSCnePArTQ3FN6Sf4bDDw4e_CkVpQ2jkjqztqw-VJo3u3x"
+
+const char* ssid = "nova";
+const char* password = "Admin1!1";
+
+// Microsoft Graph API
+const char* client_id = "b95b45e8-b71f-4259-bf1a-a1d9e049eb02";
+const char* client_secret = "8c555ef5-9c61-4db8-a8d9-03a3c7aeb937";
+const char* tenant_id = "68319250-d47d-484b-9db9-35bd25d91b9a";
+String refresh_token = "";
+String access_token = "";
+String users[] = {"0abe59bb-cfc7-40ed-bfdb-b882c6ec6270", "a1fffe8c-9be9-4a72-b255-a5679e02627b", "f9b61f67-49de-4fb1-a0e0-d2c35fad5c81"};
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+int numUsers = sizeof(users) / sizeof(users[0]); // Anzahl der Benutzer im Array
+
+void setup() {
+    Serial.begin(115200);
+    setLeds(3); // Türkis, wenn das WLAN verbindet
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nVerbunden mit WLAN");
+    
+    setLeds(0); // Aus, nachdem WLAN verbunden ist
+    
+    if (refresh_token == "") {
+        startDeviceAuth();
+    } else {
+        refreshAccessToken();
+    }
+}
+
+void loop() {
+    if (WiFi.status() == WL_CONNECTED) {
+        int priority = checkPresence(); // Überprüfe Anwesenheit aller Benutzer
+        Serial.println("Prio: " + String(priority));
+        if (priority == 3) {
+            setLeds(1); // Rot, wenn jemand "Busy" ist
+        } else if (priority == 2) {
+            setLeds(2); // Grün, wenn jemand verfügbar ist
+        } else if (priority == 1) {
+            setLeds(5);  
+        }else {
+            setLeds(0); // Aus, wenn alle offline sind
+        }
+    }
+    delay(15000); // 30 Sekunden warten
+}
+
+void startDeviceAuth() {
+    HTTPClient http;
+    http.begin("https://login.microsoftonline.com/" + String(tenant_id) + "/oauth2/v2.0/devicecode");
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    
+    String body = "client_id=" + String(client_id) + "&scope=offline_access%20Presence.Read.All";
+    int httpResponseCode = http.POST(body);
+    
+    if (httpResponseCode == 200) {
+        String response = http.getString();
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, response);
+        String device_code = doc["device_code"].as<String>();
+        String user_code = doc["user_code"].as<String>();
+        String verification_uri = doc["verification_uri"].as<String>();
+
+        // Discord Nachricht senden
+        sendToDiscord(verification_uri, user_code);
+        
+        delay(15000);
+        pollForToken(device_code);
+    } else {
+        setLeds(4); // Blau bei Fehler
+    }
+    http.end();
+}
+
+void pollForToken(String device_code) {
+    HTTPClient http;
+    while (true) {
+        http.begin("https://login.microsoftonline.com/" + String(tenant_id) + "/oauth2/v2.0/token");
+        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+        
+        String body = "client_id=" + String(client_id) + "&grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=" + device_code;
+        int httpResponseCode = http.POST(body);
+        
+        if (httpResponseCode == 200) {
+            String response = http.getString();
+            DynamicJsonDocument doc(1024);
+            deserializeJson(doc, response);
+            access_token = doc["access_token"].as<String>();
+            refresh_token = doc["refresh_token"].as<String>();
+            Serial.println("Token erhalten!");
+            break;
+        }
+        Serial.println("Warte auf Authentifizierung...");
+        delay(5000);
+    }
+    http.end();
+}
+
+void refreshAccessToken() {
+    HTTPClient http;
+    http.begin("https://login.microsoftonline.com/" + String(tenant_id) + "/oauth2/v2.0/token");
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    
+    String body = "client_id=" + String(client_id) + "&client_secret=" + String(client_secret) +
+                  "&refresh_token=" + String(refresh_token) + "&grant_type=refresh_token";
+    
+    int httpResponseCode = http.POST(body);
+    if (httpResponseCode == 200) {
+        String response = http.getString();
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, response);
+        access_token = doc["access_token"].as<String>();
+        refresh_token = doc["refresh_token"].as<String>();
+        Serial.println("Token erneuert");
+    } else {
+        Serial.println("Token Erneuerung fehlgeschlagen. Starte neuen Device Login...");
+        setLeds(4); // Blau bei Fehler
+        startDeviceAuth();
+    }
+    http.end();
+}
+
+int checkPresence() {
+    HTTPClient http;
+    int highestPriority = 0; // Startwert: 0 für "Offline"
+    
+    // Durchlaufe alle Benutzer im Array und überprüfe ihre Anwesenheit
+    for (int i = 0; i < numUsers; i++) {
+        String user = users[i];
+        Serial.println(user + " checking");
+        String url = "https://graph.microsoft.com/v1.0/users/" + user + "/presence";
+        http.begin(url);
+        http.addHeader("Authorization", "Bearer " + access_token);
+        int httpResponseCode = http.GET();
+        String response = http.getString();
+        
+        if (httpResponseCode == 401) {
+            Serial.println("401");
+            refreshAccessToken();
+            return checkPresence();
+        }
+        
+        if (httpResponseCode == 200) {
+            DynamicJsonDocument doc(1024);
+            DeserializationError error = deserializeJson(doc, response);
+            if (error) {
+                Serial.println("Fehler beim Parsen der Antwort: " + response);
+                Serial.println(error.f_str());
+                return 0; // Kein gültiger Status
+            }
+            
+            String presence = doc["availability"].as<String>();
+            int priority = 0;
+            
+            if (presence == "Busy") {
+                priority = 3; // Höchste Priorität: "Busy"
+            } else if (presence == "Available") {
+                priority = 2; // Zweithöchste Priorität: "Available"
+            } else if (presence == "Away") {
+                priority = 1;
+            }
+            
+            // Vergleiche mit der höchsten Priorität
+            if (priority > highestPriority) {
+                highestPriority = priority;
+            }
+            
+            // Debug-Ausgabe
+            Serial.println(user + " Status: " + presence + " (Priorität: " + String(priority) + ")");
+        }
+        
+        http.end();
+    }
+    
+    return highestPriority; // Gibt die höchste Priorität zurück
+}
+
+void setLeds(int status) {
+    Serial.println("Led set to " + String(status) );
+    for (int i = 0; i < LED_COUNT; i++) {
+        if (status == 1) {
+            strip.setPixelColor(i, strip.Color(255, 0, 0)); // Rot (Busy)
+        } else if (status == 2) {
+            strip.setPixelColor(i, strip.Color(0, 255, 0)); // Grün (Available)
+        } else if (status == 3) {
+            strip.setPixelColor(i, strip.Color(136, 0, 255)); // Violett (WLAN Verbindung)
+        } else if (status == 4) {
+            strip.setPixelColor(i, strip.Color(0, 0, 255)); // Blau (Fehler)
+        } else if (status == 5){
+            strip.setPixelColor(i, strip.Color(255,50, 0)); // Orange (AFK)
+        }else {
+            strip.setPixelColor(i, strip.Color(0, 0, 0)); // Aus (Offline)
+        }
+    }
+    strip.show();
+}
+
+void sendToDiscord(String verification_uri, String user_code) {
+    HTTPClient http;
+    http.begin(DISCORD_WEBHOOK_URL); // Discord Webhook URL
+    
+    // Erstelle eine JSON-Nachricht
+    String message = "{\"content\": \"Bitte öffne diese URL in deinem Browser und gib den Code ein: " + verification_uri + " und gib den Code ```" + user_code + "``` ein.\"}";
+    
+    http.addHeader("Content-Type", "application/json");
+    int httpResponseCode = http.POST(message);
+    
+    if (httpResponseCode == 204) {
+        Serial.println("Nachricht an Discord gesendet.");
+    } else {
+        Serial.println("Fehler beim Senden der Nachricht an Discord. Code: " + String(httpResponseCode));
+    }
+    http.end();
+}
