@@ -1,4 +1,4 @@
-h#include <WiFi.h>
+#include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
@@ -12,7 +12,8 @@ const char* password = "Admin1!1";
 
 // Microsoft Graph API
 const char* client_id = "b95b45e8-b71f-4259-bf1a-a1d9e049eb02";
-const char* client_secret = "8c555ef5-9c61-4db8-a8d9-03a3c7aeb937";
+const char* client_secret_ID = "c89f3766-7d93-48bc-80d5-aa7aecb068cb"; //"8c555ef5-9c61-4db8-a8d9-03a3c7aeb937"; // ID?
+const char* client_secret = "MqO8Q~Ws1B-WGv52gKdyg1EHj65QQ1sv7h2Alalc";
 const char* tenant_id = "68319250-d47d-484b-9db9-35bd25d91b9a";
 String refresh_token = "";
 String access_token = "";
@@ -56,31 +57,36 @@ void loop() {
             setLeds(0); // Aus, wenn alle offline sind
         }
     }
-    delay(15000); // 30 Sekunden warten
+    delay(15000); // 15 Sekunden warten
 }
 
 void startDeviceAuth() {
     HTTPClient http;
     http.begin("https://login.microsoftonline.com/" + String(tenant_id) + "/oauth2/v2.0/devicecode");
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    
+
     String body = "client_id=" + String(client_id) + "&scope=offline_access%20Presence.Read.All";
     int httpResponseCode = http.POST(body);
-    
+
     if (httpResponseCode == 200) {
         String response = http.getString();
         DynamicJsonDocument doc(1024);
         deserializeJson(doc, response);
+        
         String device_code = doc["device_code"].as<String>();
         String user_code = doc["user_code"].as<String>();
         String verification_uri = doc["verification_uri"].as<String>();
 
-        // Discord Nachricht senden
+        // Discord Nachricht senden (Falls du das implementiert hast)
         sendToDiscord(verification_uri, user_code);
+
+        Serial.println("Bitte gehe zu: " + verification_uri);
+        Serial.println("Gib diesen Code ein: " + user_code);
         
         delay(15000);
         pollForToken(device_code);
     } else {
+        Serial.println("Fehler beim Abrufen des Device Codes: " + http.getString());
         setLeds(4); // Blau bei Fehler
     }
     http.end();
@@ -88,24 +94,49 @@ void startDeviceAuth() {
 
 void pollForToken(String device_code) {
     HTTPClient http;
-    while (true) {
+    int max_attempts = 30;  // Verhindert Endlosschleife
+    int attempts = 0;
+
+    while (attempts < max_attempts) {
         http.begin("https://login.microsoftonline.com/" + String(tenant_id) + "/oauth2/v2.0/token");
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-        
-        String body = "client_id=" + String(client_id) + "&grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=" + device_code;
+
+        String body = "client_id=" + String(client_id) + "&client_secret=" + String(client_secret) +
+                      "&grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=" + device_code;
+
         int httpResponseCode = http.POST(body);
-        
+
         if (httpResponseCode == 200) {
             String response = http.getString();
             DynamicJsonDocument doc(1024);
             deserializeJson(doc, response);
+
             access_token = doc["access_token"].as<String>();
             refresh_token = doc["refresh_token"].as<String>();
-            Serial.println("Token erhalten!");
-            break;
+
+            int expires_in = doc["expires_in"].as<int>();  // Ablaufzeit des Tokens
+            Serial.println("Token erhalten! Gültig für " + String(expires_in) + " Sekunden.");
+
+            http.end();
+            return;
+        } else {
+            String response = http.getString();
+            Serial.println("Fehler beim Abrufen des Tokens: " + response);
+
+            DynamicJsonDocument doc(1024);
+            deserializeJson(doc, response);
+            String error = doc["error"].as<String>();
+
+            if (error == "authorization_pending") {
+                Serial.println("Warte auf Benutzerautorisierung...");
+            } else {
+                Serial.println("Fehler: " + error);
+                setLeds(4);  // Blau bei Fehler
+                break;  // Raus aus der Schleife
+            }
         }
-        Serial.println("Warte auf Authentifizierung...");
         delay(5000);
+        attempts++;
     }
     http.end();
 }
@@ -114,26 +145,32 @@ void refreshAccessToken() {
     HTTPClient http;
     http.begin("https://login.microsoftonline.com/" + String(tenant_id) + "/oauth2/v2.0/token");
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    
-    String body = "client_id=" + String(client_id) + "&client_secret=" + String(client_secret) +
+
+    String body = "client_id=" + String(client_id) +
                   "&refresh_token=" + String(refresh_token) + "&grant_type=refresh_token";
-    
+
     int httpResponseCode = http.POST(body);
+
     if (httpResponseCode == 200) {
         String response = http.getString();
         DynamicJsonDocument doc(1024);
         deserializeJson(doc, response);
+
         access_token = doc["access_token"].as<String>();
-        refresh_token = doc["refresh_token"].as<String>();
-        Serial.println("Token erneuert");
+
+        if (doc.containsKey("refresh_token")) {
+            refresh_token = doc["refresh_token"].as<String>();
+        }
+
+        Serial.println("Token erfolgreich erneuert.");
     } else {
         Serial.println("Token Erneuerung fehlgeschlagen. Starte neuen Device Login...");
+        Serial.println(http.getString());
         setLeds(4); // Blau bei Fehler
         startDeviceAuth();
     }
     http.end();
 }
-
 int checkPresence() {
     HTTPClient http;
     int highestPriority = 0; // Startwert: 0 für "Offline"
@@ -170,7 +207,7 @@ int checkPresence() {
                 priority = 3; // Höchste Priorität: "Busy"
             } else if (presence == "Available") {
                 priority = 2; // Zweithöchste Priorität: "Available"
-            } else if (presence == "Away") {
+            } else if (presence == "Away" || "BeRightBack" ) {
                 priority = 1;
             }
             
